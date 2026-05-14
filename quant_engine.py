@@ -1,6 +1,7 @@
 import time
 import requests
 import datetime
+import pytz
 from duckduckgo_search import DDGS
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import playergamelog
@@ -25,8 +26,8 @@ def search_live_web(query: str, max_results: int = 3) -> str:
 # ==========================================
 # ⚡ TOOL 2: THE REALITY CHECK (SCHEDULE VERIFIER)
 # ==========================================
-def get_todays_slate(sport: str) -> str:
-    """Pulls the exact, verified schedule for today to prevent the AI from hallucinating games."""
+def get_todays_slate(sport: str, date_str: str = "today") -> str:
+    """Pulls the exact, verified schedule for a specific date to prevent hallucinations."""
     sport = sport.upper()
     espn_routes = {
         "NBA": ("basketball", "nba"),
@@ -41,18 +42,28 @@ def get_todays_slate(sport: str) -> str:
     if not route:
         return f"Error: Sport '{sport}' not supported by schedule verifier."
         
-    url = f"https://site.api.espn.com/apis/site/v2/sports/{route[0]}/{route[1]}/scoreboard"
+    # Calculate the correct date for the ESPN API
+    now = datetime.datetime.now(pytz.timezone('America/New_York'))
+    if date_str.strip().lower() == "tomorrow":
+        target_date = now + datetime.timedelta(days=1)
+    elif date_str.strip().lower() == "yesterday":
+        target_date = now - datetime.timedelta(days=1)
+    else:
+        target_date = now
+        
+    formatted_date = target_date.strftime('%Y%m%d')
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{route[0]}/{route[1]}/scoreboard?dates={formatted_date}"
     
     try:
         response = requests.get(url, timeout=8)
         if response.status_code != 200:
-            return "Schedule API Error. Could not verify today's games."
+            return f"Schedule API Error. Could not verify games for {date_str}."
             
         data = response.json()
         events = data.get('events', [])
         
         if not events:
-            return f"VERIFIED: No {sport} games scheduled for today."
+            return f"VERIFIED: No {sport} games scheduled for {date_str} ({formatted_date})."
             
         schedule = []
         for event in events:
@@ -65,7 +76,7 @@ def get_todays_slate(sport: str) -> str:
             
             schedule.append(f"[{status}] {away_team} @ {home_team}")
             
-        return f"--- VERIFIED TODAY'S SLATE FOR {sport} ---\n" + "\n".join(schedule)
+        return f"--- VERIFIED SLATE FOR {sport} ON {date_str.upper()} ---\n" + "\n".join(schedule)
         
     except Exception as e:
         return f"Schedule Fetch Error: {str(e)}"
