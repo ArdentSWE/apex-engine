@@ -6,4 +6,5 @@ nba_api
 duckduckgo-search
 yfinance
 pandas
-pytzaiohttp
+pytz
+aiohttp
