@@ -6,6 +6,7 @@ import pytz
 import json
 import re
 import aiohttp
+import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,78 @@ router = APIRouter()
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY")
 POLYGON_KEY = os.environ.get("POLYGON_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+# ==========================================
+# SMC MATH ENGINE (Ported from bot.py)
+# ==========================================
+
+async def compute_smc_data(ticker: str):
+    """Calculates true Volume POC, Order Blocks, and Flow for a ticker."""
+    try:
+        stock = await asyncio.to_thread(yf.Ticker, ticker)
+        hist = stock.history(period="90d")
+        if hist.empty or len(hist) < 30: return None
+        
+        close = hist['Close'].iloc[-1]
+        
+        # 1. Volume Point of Control (POC)
+        hist['Price_Bins'] = pd.cut(hist['Close'], bins=30)
+        vol_profile = hist.groupby('Price_Bins', observed=False)['Volume'].sum()
+        poc_price = vol_profile.idxmax().mid
+        
+        # 2. Order Blocks
+        recent = hist.tail(30).copy()
+        recent['Return'] = recent['Close'].pct_change()
+        best_day_loc = recent.index.get_loc(recent['Return'].idxmax())
+        worst_day_loc = recent.index.get_loc(recent['Return'].idxmin())
+        
+        bullish_ob = 0
+        bearish_ob = float('inf')
+        
+        if best_day_loc > 0:
+            ob_candle = recent.iloc[best_day_loc - 1]
+            if ob_candle['Close'] < ob_candle['Open']: bullish_ob = ob_candle['Low']
+        if worst_day_loc > 0:
+            ob_candle = recent.iloc[worst_day_loc - 1]
+            if ob_candle['Close'] > ob_candle['Open']: bearish_ob = ob_candle['High']
+            
+        # 3. Polygon Live Flow & Gamma
+        call_prem, put_prem, net_gamma = 0, 0, 0
+        if POLYGON_KEY:
+            url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?limit=250&apiKey={POLYGON_KEY}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for c in data.get("results", []):
+                            ctype = c.get('details', {}).get('contract_type', '').lower()
+                            oi = c.get('open_interest', 0)
+                            vol = c.get('day', {}).get('volume', 0)
+                            vwap = c.get('day', {}).get('vwap', 0)
+                            
+                            prem = vol * vwap * 100
+                            if ctype == 'call': call_prem += prem
+                            elif ctype == 'put': put_prem += prem
+                            
+                            greeks = c.get("greeks")
+                            if greeks and oi > 100:
+                                gex = greeks.get('gamma', 0) * oi * 100
+                                if ctype == 'call': net_gamma += gex
+                                else: net_gamma -= gex
+        
+        return {
+            "ticker": ticker,
+            "close": round(close, 2),
+            "poc": round(poc_price, 2),
+            "bullish_ob": round(bullish_ob, 2),
+            "bearish_ob": round(bearish_ob, 2),
+            "call_prem": call_prem,
+            "put_prem": put_prem,
+            "net_gamma": net_gamma
+        }
+    except Exception as e:
+        print(f"SMC Error for {ticker}: {e}")
+        return None
 
 # ==========================================
 # PILLAR 1: EQUITIES & OPTIONS (The Web Terminal)
@@ -170,24 +243,33 @@ async def get_options_heatmap(ticker: str):
 @router.get("/api/equities/global_plays")
 async def get_global_plays():
     try:
+        tickers_to_scan = ["SPY", "QQQ", "NVDA"]
+        results = await asyncio.gather(*[compute_smc_data(t) for t in tickers_to_scan])
+        
+        context_data = ""
+        for r in results:
+            if r:
+                context_data += f"[{r['ticker']}] Live: ${r['close']} | 90d POC: ${r['poc']} | Bull OB: ${r['bullish_ob']} | Bear OB: ${r['bearish_ob']} | Call Prem: ${r['call_prem']:,.0f} | Put Prem: ${r['put_prem']:,.0f} | Net GEX: {r['net_gamma']:,.0f}\n"
+
         client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
         now_str = datetime.datetime.now(pytz.timezone('America/New_York')).strftime('%B %d, %Y')
         
         sys_prompt = f"""
-        You are the 'Apex Options Desk', an autonomous quantitative AI reading Smart Money Concepts.
+        You are the 'Apex Options Desk', an autonomous quantitative AI.
         Current Date: {now_str}.
         
-        Scan your knowledge of the current macro environment and generate exactly THREE high-probability options setups for highly liquid mega-caps (e.g., SPY, QQQ, NVDA, TSLA, AAPL, META).
-        Provide 1 DAY TRADE (0-2 DTE), 1 SWING (1-4 weeks), and 1 LEAP (3+ months).
+        Here is the exact live structural data for three major assets:
+        {context_data}
         
-        Base your thesis heavily on Volume Point of Control (POC), Order Blocks, and dark pool flow structure.
+        Construct exactly THREE options plays (one for each ticker) based STRICTLY on this data. Do not hallucinate support/resistance. Use the POC and Order Blocks provided.
+        Assign 1 DAY TRADE, 1 SWING, and 1 LEAP across the 3 tickers based on what makes sense given the flow and structure.
         
         Return ONLY a JSON array of 3 objects with this exact structure:
         [
           {{
-            "ticker": "AAPL", "play_type": "SWING", "direction": "CALLS", "confidence": 92, 
-            "strike": "180C", "expiration": "Next Month",
-            "thesis": "Price has tapped a massive bullish order block while maintaining support above the 90-day Volume POC."
+            "ticker": "SPY", "play_type": "DAY TRADE", "direction": "CALLS", "confidence": 88, 
+            "strike": "520C", "expiration": "0DTE",
+            "thesis": "Price is rebounding off the bullish order block at $X with heavy call premium."
           }}
         ]
         """
@@ -206,22 +288,30 @@ async def get_global_plays():
 @router.get("/api/equities/ticker_idea")
 async def get_ticker_idea(ticker: str):
     try:
+        smc_data = await compute_smc_data(ticker.upper())
+        if not smc_data:
+            return {"error": "Insufficient market data.", "idea": None}
+            
+        context_data = f"[{smc_data['ticker']}] Live: ${smc_data['close']} | 90d POC: ${smc_data['poc']} | Bull OB: ${smc_data['bullish_ob']} | Bear OB: ${smc_data['bearish_ob']} | Call Prem: ${smc_data['call_prem']:,.0f} | Put Prem: ${smc_data['put_prem']:,.0f} | Net GEX: {smc_data['net_gamma']:,.0f}"
+
         client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
         now_str = datetime.datetime.now(pytz.timezone('America/New_York')).strftime('%B %d, %Y')
         
         sys_prompt = f"""
-        You are the 'Apex Options Desk', an autonomous quantitative AI reading Smart Money Concepts.
+        You are the 'Apex Options Desk', an autonomous quantitative AI.
         Current Date: {now_str}.
         
-        Generate a highly confident, institutional-grade options trade thesis for {ticker.upper()}.
-        Determine the best timeframe (DAY TRADE, SWING, or LEAP) based on current volatility and structure.
-        Base your thesis heavily on Order Blocks, VWAP, and Gamma Exposure (GEX) concepts.
+        Here is the exact live structural data for {ticker.upper()}:
+        {context_data}
+        
+        Construct an institutional options trade thesis based STRICTLY on this data. Do not hallucinate levels. Reference the POC, Order Blocks, and premium flow in your thesis.
+        Determine the best timeframe (DAY TRADE, SWING, or LEAP) based on structure.
         
         Return ONLY a JSON object with this exact structure:
         {{
             "ticker": "{ticker.upper()}", "play_type": "SWING", "direction": "PUTS", "confidence": 88, 
             "strike": "150P", "expiration": "Date",
-            "thesis": "1-2 sentence ruthless, institutional breakdown of the SMC setup."
+            "thesis": "1-2 sentence ruthless, institutional breakdown using the provided math."
         }}
         """
         res = await client.messages.create(
@@ -239,9 +329,7 @@ async def get_ticker_idea(ticker: str):
 # ==========================================
 # PILLAR 2: SPORTS BETTING MODELS
 # ==========================================
-
 def fetch_live_data_sync(sport: str, target_date_str: str = "Today"):
-    """Pulls live boards, home/away data, active rosters, and REAL-TIME INJURY SCRATCHES."""
     sport = sport.upper()
     espn_routes = {
         "NBA": ("basketball", "nba"), "NFL": ("football", "nfl"), "MLB": ("baseball", "mlb"),
