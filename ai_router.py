@@ -14,11 +14,14 @@ def get_agent_tools():
     return [
         {
             "name": "get_todays_slate",
-            "description": "Pulls the official, verified schedule for today. You MUST use this to verify a game is actually happening before analyzing it.",
+            "description": "Pulls the official, verified schedule. You MUST use this to verify a game is actually happening on the requested date before analyzing it.",
             "input_schema": {
                 "type": "object",
-                "properties": {"sport": {"type": "string", "description": "e.g., 'NBA', 'NFL', 'MLB', 'NHL', 'SOC', 'CRICKET'"}},
-                "required": ["sport"]
+                "properties": {
+                    "sport": {"type": "string", "description": "e.g., 'NBA', 'NFL', 'MLB', 'NHL', 'SOC', 'CRICKET'"},
+                    "date_str": {"type": "string", "description": "Must be 'today', 'tomorrow', or 'yesterday'. Look at the user's prompt to determine which one to use."}
+                },
+                "required": ["sport", "date_str"]
             }
         },
         {
@@ -72,7 +75,7 @@ async def execute_omni_agent(mode: str, sport: str, live_board: str, user_prompt
     You are equipped with web scraping, schedule verification, and backtesting tools.
 
     THE ANTI-HALLUCINATION PROTOCOL:
-    1. VERIFY: You must use `get_todays_slate` to confirm the requested game is happening today.
+    1. VERIFY: You must use `get_todays_slate` to confirm the requested game is happening on the requested date.
     2. PRICE: You must use `search_live_web` to find the exact live odds and lines for the props you are considering.
     3. BACKTEST: You MUST run `get_free_l20_hit_rate` on EVERY potential player leg.
     4. ABORT: If you cannot verify the game, cannot find live odds, or if the backtest returns under an 80% hit rate, you must discard the leg immediately. Do not guess. Do not estimate.
@@ -126,7 +129,8 @@ async def execute_omni_agent(mode: str, sport: str, live_board: str, user_prompt
                         elif func_name == "get_todays_slate":
                             res_str = await asyncio.to_thread(
                                 get_todays_slate,
-                                args.get('sport')
+                                args.get('sport'),
+                                args.get('date_str', 'today') # <--- Passing the date properly
                             )
                     except Exception as e:
                         res_str = f"Execution error: {str(e)}"
