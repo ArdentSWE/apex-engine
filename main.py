@@ -2,7 +2,7 @@ import os
 import requests
 from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-import anthropic
+from ai_router import execute_omni_agent
 
 app = FastAPI(title="Apex Engine", version="2.0")
 
@@ -19,9 +19,6 @@ router = APIRouter()
 
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY")
 POLYGON_KEY = os.environ.get("POLYGON_API_KEY")
-
-# Brainwash Claude 4.7 into the Apex Quant Engine
-anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 # ==========================================
 # PILLAR 1: EQUITIES & OPTIONS (The Terminal)
@@ -76,67 +73,38 @@ def get_quant_signals(type: str = "all"):
     return {"signals": signals}
 
 # ==========================================
-# PILLAR 2: SPORTS BETTING MODELS (ANTHROPIC 4.7)
+# PILLAR 2: SPORTS BETTING MODELS (OMNI AGENT)
 # ==========================================
 
 @router.get("/api/sports/parlays")
-def generate_parlay(league: str = "NBA", team1: str = "", team2: str = "", market: str = "", legs: str = "3", date: str = "Today"):
+async def generate_parlay(league: str = "NBA", team1: str = "", team2: str = "", market: str = "", legs: str = "3", date: str = "Today"):
     try:
-        sys_prompt = f"""
-        You are the 'Apex Quant Engine', an elite sports betting risk manager. Do NOT mention Anthropic, Claude, or AI.
-        Construct a logical {legs}-leg parlay for {team1} vs {team2} in the {league} occurring on {date}. 
-        Market Focus: {market}.
+        user_prompt = f"Construct a {legs}-leg parlay for {team1} vs {team2} on {date}. Market focus: {market}. Format with 🔥 THE GOD PARLAY:, 🎯 CONFIDENCE:, 💰 UNIT SIZING:, and 🧠 THE THESIS (LEG BY LEG):"
         
-        FORMAT EXACTLY LIKE THIS:
-        🔥 **THE GOD PARLAY:** [List the exact {legs} legs and the estimated odds, e.g., +450]
-        🎯 **CONFIDENCE:** [Percentage between 80-99%]
-        💰 **UNIT SIZING:** [Recommend unit size]
-        
-        **🧠 THE THESIS (LEG BY LEG):**
-        - **[Leg 1]:** [1-sentence reasoning based on stats/matchups]
-        - **[Leg 2]:** [1-sentence reasoning]
-        """
-        
-        msg = anthropic_client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=1000,
-            system=sys_prompt,
-            messages=[{"role": "user", "content": "Generate the quant parlay."}]
+        # Trigger the true agent with L20 backtesting and Web Scraping
+        result_text = await execute_omni_agent(
+            mode="PARLAY", 
+            sport=league, 
+            live_board="Check schedule tool", 
+            user_prompt=user_prompt
         )
-        
-        return {"result_text": msg.content[0].text}
-        
+        return {"result_text": result_text}
     except Exception as e:
         return {"result_text": f"❌ Neural link disrupted: {str(e)}"}
 
 @router.get("/api/sports/predictor")
-def predict_game(team1: str, team2: str, sport: str = "NBA", market: str = "", date: str = "Today"):
+async def predict_game(team1: str, team2: str, sport: str = "NBA", market: str = "", date: str = "Today"):
     try:
-        sys_prompt = f"""
-        You are the 'Apex Game Predictor', an elite quantitative risk manager. Do NOT mention Anthropic, Claude, or AI.
-        Identify the single highest confidence play for {team1} vs {team2} in the {sport} occurring on {date}.
-        Market Focus: {market}.
+        user_prompt = f"Identify the single highest confidence play for {team1} vs {team2} on {date}. Market focus: {market}. Format with 🔥 TOP PLAY:, 🎯 CONFIDENCE:, 💰 UNIT SIZING:, and 🧠 THE THESIS:"
         
-        FORMAT EXACTLY LIKE THIS:
-        🔥 **TOP PLAY:** [State the single best exact bet clearly, e.g., TIMBERWOLVES -4.5]
-        🎯 **CONFIDENCE:** [Percentage between 80-99%]
-        💰 **UNIT SIZING:** [Recommend unit size]
-        
-        **🧠 THE THESIS:**
-        - [Bullet 1: Statistical trend or home/away split]
-        - [Bullet 2: Specific matchup or injury advantage]
-        - [Bullet 3: Market pricing/value]
-        """
-        
-        msg = anthropic_client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=1000,
-            system=sys_prompt,
-            messages=[{"role": "user", "content": "Generate the game prediction."}]
+        # Trigger the true agent with L20 backtesting and Web Scraping
+        result_text = await execute_omni_agent(
+            mode="PREDICTOR", 
+            sport=sport, 
+            live_board="Check schedule tool", 
+            user_prompt=user_prompt
         )
-        
-        return {"result_text": msg.content[0].text}
-        
+        return {"result_text": result_text}
     except Exception as e:
         return {"result_text": f"❌ Neural link disrupted: {str(e)}"}
 
