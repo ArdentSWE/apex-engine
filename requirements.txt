@@ -42,3 +42,4 @@ uvloop==0.22.1
 watchfiles==1.1.1
 websockets==16.0
 yfinance==1.3.0
+anthropic
