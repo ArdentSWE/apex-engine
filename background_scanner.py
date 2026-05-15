@@ -22,51 +22,45 @@ TOP_100_TICKERS = [
     "SHOP", "WDAY", "MDB", "SQ", "ROKU", "COIN", "PYPL", "HOOD", "MARA", "DKNG"
 ]
 
-async def get_technical_trend(ticker: str):
-    """STEP 1: Fast, free technical scan using VWAP and EMA9 to confirm momentum."""
+async def analyze_flow_and_chart(ticker: str):
+    """
+    PHASE 1: Finds the live price and charts the technicals.
+    PHASE 2: Scans for Whale Flow.
+    PHASE 3: Confirms the setup if Flow and Chart agree.
+    """
     try:
+        # -----------------------------------------------------
+        # 1. READ THE CHART (Technicals)
+        # -----------------------------------------------------
         df = await asyncio.to_thread(yf.download, tickers=ticker, period="5d", interval="5m", progress=False)
         if df.empty or len(df) < 20: return None
         
-        # Handle multi-index columns from yfinance update
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.droplevel(1)
 
-        # Calculate VWAP
         df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
         df['Cum_Vol'] = df['Volume'].cumsum()
         df['Cum_Vol_Price'] = (df['Typical_Price'] * df['Volume']).cumsum()
-        df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
         
-        # Calculate EMA9
+        # Core Indicators
+        df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
         df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
 
         close = float(df['Close'].iloc[-1])
-        ema9 = float(df['EMA9'].iloc[-1])
         vwap = float(df['VWAP'].iloc[-1])
+        ema9 = float(df['EMA9'].iloc[-1])
 
-        # STRICT TREND DEFINITION
-        trend = "CHOP"
-        if close > ema9 and ema9 > vwap: trend = "BULLISH"
-        elif close < ema9 and ema9 < vwap: trend = "BEARISH"
+        # -----------------------------------------------------
+        # 2. FIND THE WHALE FLOW (Tape Reading)
+        # -----------------------------------------------------
+        if not POLYGON_KEY: return None
 
-        return {"ticker": ticker, "close": close, "ema9": ema9, "vwap": vwap, "trend": trend}
-    except Exception as e:
-        return None
+        day_calls, day_puts = 0, 0
+        swing_calls, swing_puts = 0, 0
+        leap_calls, leap_puts = 0, 0
 
-async def get_options_flow(ticker_data):
-    """STEP 2: Only hits Polygon for stocks in a confirmed trend to verify institutional backing."""
-    if not POLYGON_KEY: return None
-    
-    ticker = ticker_data['ticker']
-    close = ticker_data['close']
-
-    day_calls, day_puts = 0, 0
-    swing_calls, swing_puts = 0, 0
-    leap_calls, leap_puts = 0, 0
-
-    try:
-        min_strike, max_strike = close * 0.75, close * 1.25
+        # Bound to +/- 20% to avoid dead strikes
+        min_strike, max_strike = close * 0.80, close * 1.20
         url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
         pages = 0
 
@@ -80,13 +74,11 @@ async def get_options_flow(ticker_data):
                             ctype = details.get('contract_type', '').lower()
                             exp_str = details.get('expiration_date', '')
 
-                            # Fallback logic: Use OI if intraday volume is missing
                             vol = c.get('day', {}).get('volume', 0)
-                            if vol == 0: vol = c.get('open_interest', 0)
+                            if vol == 0: vol = c.get('open_interest', 0) # Fallback to OI
                             
-                            # Fallback logic: Use Ask if VWAP is missing
-                            vwap = c.get('day', {}).get('vwap', 0)
-                            price = vwap if vwap > 0 else c.get('last_quote', {}).get('ask', 0)
+                            vwap_price = c.get('day', {}).get('vwap', 0)
+                            price = vwap_price if vwap_price > 0 else c.get('last_quote', {}).get('ask', 0)
 
                             if not exp_str or vol == 0 or price == 0: continue
 
@@ -94,7 +86,7 @@ async def get_options_flow(ticker_data):
                             exp_date = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
                             dte = (exp_date - datetime.date.today()).days
 
-                            # Bucket the flow by Timeframe
+                            # Bucket by Play Type
                             if dte <= 7:
                                 if ctype == 'call': day_calls += prem
                                 else: day_puts += prem
@@ -109,101 +101,98 @@ async def get_options_flow(ticker_data):
                         url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
                         pages += 1
                     elif resp.status == 429:
-                        await asyncio.sleep(5) # API Rate Limit Pause
+                        await asyncio.sleep(5) # Prevent DDoS
                     else:
                         break
 
-        ticker_data.update({
-            "day_calls": day_calls, "day_puts": day_puts,
-            "swing_calls": swing_calls, "swing_puts": swing_puts,
-            "leap_calls": leap_calls, "leap_puts": leap_puts
-        })
-        return ticker_data
+        # -----------------------------------------------------
+        # 3. CONFIRM THE SETUP (Flow + Chart Convergence)
+        # -----------------------------------------------------
+        confirmed_plays = []
+        metrics = {"close": close, "vwap": vwap, "ema9": ema9}
+
+        # A. Evaluate Day Trades (0-7 DTE)
+        total_day = day_calls + day_puts
+        if total_day > 250000:
+            call_skew = day_calls / total_day
+            # Confirm Call Setup
+            if call_skew > 0.60 and close > vwap:
+                print(f"[{ticker}] ⚡ DAY CALLS Confirmed | Flow: ${day_calls/1000000:.1f}M | Chart: Price > VWAP")
+                confirmed_plays.append({"ticker": ticker, "type": "DAY TRADE", "dir": "CALLS", "score": total_day * call_skew, "data": metrics})
+            # Confirm Put Setup
+            elif call_skew < 0.40 and close < vwap:
+                print(f"[{ticker}] ⚡ DAY PUTS Confirmed | Flow: ${day_puts/1000000:.1f}M | Chart: Price < VWAP")
+                confirmed_plays.append({"ticker": ticker, "type": "DAY TRADE", "dir": "PUTS", "score": total_day * (1 - call_skew), "data": metrics})
+
+        # B. Evaluate Swings (8-90 DTE)
+        total_swing = swing_calls + swing_puts
+        if total_swing > 500000:
+            call_skew = swing_calls / total_swing
+            # Confirm Call Setup
+            if call_skew > 0.60 and close > ema9:
+                print(f"[{ticker}] 🎯 SWING CALLS Confirmed | Flow: ${swing_calls/1000000:.1f}M | Chart: Price > EMA9")
+                confirmed_plays.append({"ticker": ticker, "type": "SWING", "dir": "CALLS", "score": total_swing * call_skew, "data": metrics})
+            # Confirm Put Setup
+            elif call_skew < 0.40 and close < ema9:
+                print(f"[{ticker}] 🎯 SWING PUTS Confirmed | Flow: ${swing_puts/1000000:.1f}M | Chart: Price < EMA9")
+                confirmed_plays.append({"ticker": ticker, "type": "SWING", "dir": "PUTS", "score": total_swing * (1 - call_skew), "data": metrics})
+
+        # C. Evaluate Leaps (90+ DTE)
+        total_leap = leap_calls + leap_puts
+        if total_leap > 1000000:
+            call_skew = leap_calls / total_leap
+            # Confirm Call Setup
+            if call_skew > 0.65 and close > ema9:
+                print(f"[{ticker}] 🔭 LEAP CALLS Confirmed | Flow: ${leap_calls/1000000:.1f}M | Chart: Price > EMA9")
+                confirmed_plays.append({"ticker": ticker, "type": "LEAP", "dir": "CALLS", "score": total_leap * call_skew, "data": metrics})
+            # Confirm Put Setup
+            elif call_skew < 0.35 and close < ema9:
+                print(f"[{ticker}] 🔭 LEAP PUTS Confirmed | Flow: ${leap_puts/1000000:.1f}M | Chart: Price < EMA9")
+                confirmed_plays.append({"ticker": ticker, "type": "LEAP", "dir": "PUTS", "score": total_leap * (1 - call_skew), "data": metrics})
+
+        return confirmed_plays
         
     except Exception as e:
         return None
 
 async def run_apex_scan():
-    print(f"[{datetime.datetime.now()}] PHASE 1: INITIATING TECHNICAL TREND SCAN...")
+    print(f"[{datetime.datetime.now()}] 🔍 INITIATING FLOW -> CHART SCANNER...\n")
     
-    # 1. SCAN ALL TICKERS FOR TECHNICAL TRENDS (Fast & Free)
-    tech_sem = asyncio.Semaphore(20)
-    async def safe_tech(t):
-        async with tech_sem:
-            return await get_technical_trend(t)
-            
-    tech_results = await asyncio.gather(*[safe_tech(t) for t in TOP_100_TICKERS])
-    trending_tickers = [r for r in tech_results if r is not None and r['trend'] != "CHOP"]
-    
-    print(f"Found {len(trending_tickers)} tickers in confirmed mechanical trends. Discarding the chop.")
-    if not trending_tickers:
-        print("Market is completely flat. No setups found.")
-        with open("latest_scans.json", "w") as f: json.dump({"plays": []}, f)
-        return
-
-    # 2. SCAN ONLY THE TRENDING TICKERS FOR OPTIONS FLOW
-    print(f"\nPHASE 2: CROSS-REFERENCING INSTITUTIONAL FLOW...")
-    flow_sem = asyncio.Semaphore(10)
-    async def safe_flow(data):
-        async with flow_sem:
+    sem = asyncio.Semaphore(10)
+    async def safe_scan(t):
+        async with sem:
             await asyncio.sleep(0.2)
-            return await get_options_flow(data)
+            return await analyze_flow_and_chart(t)
             
-    flow_results = await asyncio.gather(*[safe_flow(d) for d in trending_tickers])
-    confirmed_data = [r for r in flow_results if r is not None]
-
-    day_cands, swing_cands, leap_cands = [], [], []
-
-    # 3. FILTER BY CONVERGENCE (Tech Trend MUST align with Flow Skew)
-    for r in confirmed_data:
-        trend = r['trend']
-        
-        # Day Trades
-        total_day = r['day_calls'] + r['day_puts']
-        if total_day > 250000:
-            call_skew = r['day_calls'] / total_day
-            if trend == "BULLISH" and call_skew > 0.60:
-                day_cands.append({"ticker": r['ticker'], "score": total_day * call_skew, "data": r, "dir": "CALLS"})
-            elif trend == "BEARISH" and call_skew < 0.40:
-                day_cands.append({"ticker": r['ticker'], "score": total_day * (1 - call_skew), "data": r, "dir": "PUTS"})
-
-        # Swing Trades
-        total_swing = r['swing_calls'] + r['swing_puts']
-        if total_swing > 500000:
-            call_skew = r['swing_calls'] / total_swing if total_swing > 0 else 0
-            if trend == "BULLISH" and call_skew > 0.60:
-                swing_cands.append({"ticker": r['ticker'], "score": total_swing * call_skew, "data": r, "dir": "CALLS"})
-            elif trend == "BEARISH" and call_skew < 0.40:
-                swing_cands.append({"ticker": r['ticker'], "score": total_swing * (1 - call_skew), "data": r, "dir": "PUTS"})
-
-        # Leaps
-        total_leap = r['leap_calls'] + r['leap_puts']
-        if total_leap > 1000000:
-            call_skew = r['leap_calls'] / total_leap if total_leap > 0 else 0
-            if trend == "BULLISH" and call_skew > 0.60:
-                leap_cands.append({"ticker": r['ticker'], "score": total_leap * call_skew, "data": r, "dir": "CALLS"})
-            elif trend == "BEARISH" and call_skew < 0.40:
-                leap_cands.append({"ticker": r['ticker'], "score": total_leap * (1 - call_skew), "data": r, "dir": "PUTS"})
-
-    top_days = [{"ticker": c['ticker'], "dir": c['dir'], "metrics": c['data']} for c in sorted(day_cands, key=lambda x: x['score'], reverse=True)[:6]]
-    top_swings = [{"ticker": c['ticker'], "dir": c['dir'], "metrics": c['data']} for c in sorted(swing_cands, key=lambda x: x['score'], reverse=True)[:6]]
-    top_leaps = [{"ticker": c['ticker'], "dir": c['dir'], "metrics": c['data']} for c in sorted(leap_cands, key=lambda x: x['score'], reverse=True)[:6]]
+    results = await asyncio.gather(*[safe_scan(t) for t in TOP_100_TICKERS])
     
-    if not top_days and not top_swings and not top_leaps:
-        print("\nScan complete. Tech is trending, but Flow isn't confirming. Writing empty schema.")
+    # Flatten the results
+    all_plays = []
+    for r in results:
+        if r: all_plays.extend(r)
+
+    # Sort into categories
+    day_plays = sorted([p for p in all_plays if p['type'] == "DAY TRADE"], key=lambda x: x['score'], reverse=True)[:6]
+    swing_plays = sorted([p for p in all_plays if p['type'] == "SWING"], key=lambda x: x['score'], reverse=True)[:6]
+    leap_plays = sorted([p for p in all_plays if p['type'] == "LEAP"], key=lambda x: x['score'], reverse=True)[:6]
+    
+    if not day_plays and not swing_plays and not leap_plays:
+        print("\nScan complete. No setups found where Whale Flow and Chart Technicals agree.")
         with open("latest_scans.json", "w") as f: json.dump({"plays": []}, f)
         return
 
-    print(f"\n[SCAN COMPLETE] Tech & Flow Converged on {len(top_days)} Day Trades, {len(top_swings)} Swings, and {len(top_leaps)} Whales. Generating UI Payload...")
+    print(f"\n✅ Scan Complete. Found {len(day_plays)} Day Trades, {len(swing_plays)} Swings, {len(leap_plays)} Leaps.")
+    print("Formatting payload for website...")
 
-    context_data = f"--- DAY TRADES ---\n{top_days}\n--- SWINGS ---\n{top_swings}\n--- LEAPS ---\n{top_leaps}"
+    context_data = f"--- DAY TRADES ---\n{day_plays}\n--- SWINGS ---\n{swing_plays}\n--- LEAPS ---\n{leap_plays}"
 
-    # 4. SEND TO CLAUDE FOR FORMATTING
     client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
     sys_prompt = f"""
-    You are the 'Apex Options Desk'. Convert these mathematically verified setups into the UI JSON payload.
+    You are the 'Apex Options Desk'. Convert these verified setups into the UI JSON payload.
     The technicals (Price, EMA9, VWAP) ALIGN perfectly with the directional options flow.
     DO NOT guess the direction, strictly use the "dir" (CALLS or PUTS) provided.
+    
+    In your thesis, briefly mention the flow and the chart confirmation (e.g. "Massive call flow detected as price breaks above VWAP").
     
     Raw Telemetry:
     {context_data}
