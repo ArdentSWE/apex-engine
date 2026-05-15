@@ -64,10 +64,12 @@ async def compute_smc_data(ticker: str):
             ob_candle = recent.iloc[worst_day_loc - 1]
             if ob_candle['Close'] > ob_candle['Open']: bearish_ob = ob_candle['High']
             
-        # 3. Polygon Live Flow & Gamma
+        # 3. Polygon Live Flow & Gamma (With Bounding)
         call_prem, put_prem, net_gamma = 0, 0, 0
         if POLYGON_KEY:
-            url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?limit=250&apiKey={POLYGON_KEY}"
+            min_strike, max_strike = close * 0.85, close * 1.15
+            url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
+            
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -125,32 +127,43 @@ def get_macro_docket(ticker: str = ""):
 async def get_options_flow(ticker: str = "SPY"):
     if not POLYGON_KEY: return {"tape": []}
     try:
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?limit=250&apiKey={POLYGON_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                
+        stock = await asyncio.to_thread(yf.Ticker, ticker)
+        live_price = stock.fast_info['last_price']
+        min_strike, max_strike = live_price * 0.85, live_price * 1.15
+        
+        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
         flow_list = []
-        for c in data.get("results", []):
-            details = c.get("details", {})
-            vol = c.get("day", {}).get("volume", 0)
-            vwap = c.get("day", {}).get("vwap", 0)
-            if vol > 0 and vwap > 0:
-                premium = vol * vwap * 100
-                ctype = details.get("contract_type", "").upper()
-                strike = details.get("strike_price")
-                exp = details.get("expiration_date")
-                flow_list.append({
-                    "contract": f"{strike}{ctype[0]} ({exp[5:]})",
-                    "size": vol,
-                    "premium_val": premium,
-                    "price": vwap
-                })
+        pages = 0
+        
+        async with aiohttp.ClientSession() as session:
+            while url and pages < 10:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for c in data.get("results", []):
+                            details = c.get("details", {})
+                            vol = c.get("day", {}).get("volume", 0)
+                            vwap = c.get("day", {}).get("vwap", 0)
+                            if vol > 0 and vwap > 0:
+                                premium = vol * vwap * 100
+                                ctype = details.get("contract_type", "").upper()
+                                strike = details.get("strike_price")
+                                exp = details.get("expiration_date")
+                                flow_list.append({
+                                    "contract": f"{strike}{ctype[0]} ({exp[5:]})",
+                                    "size": vol,
+                                    "premium_val": premium,
+                                    "price": vwap
+                                })
+                        next_url = data.get("next_url")
+                        url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
+                        pages += 1
+                    else:
+                        break
         
         flow_list.sort(key=lambda x: x["premium_val"], reverse=True)
-        
         formatted_tape = []
-        for f in flow_list[:8]:
+        for f in flow_list[:15]: 
             formatted_tape.append({
                 "ticker": f["contract"],
                 "size": f"{f['size']:,}",
@@ -159,7 +172,8 @@ async def get_options_flow(ticker: str = "SPY"):
                 "time": "LIVE"
             })
         return {"tape": formatted_tape}
-    except Exception:
+    except Exception as e:
+        print(e)
         return {"tape": []}
 
 @router.get("/api/gex")
@@ -168,30 +182,37 @@ async def get_gamma_exposure(ticker: str):
     try:
         stock = await asyncio.to_thread(yf.Ticker, ticker)
         live_price = stock.fast_info['last_price']
+        min_strike, max_strike = live_price * 0.85, live_price * 1.15
         
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?limit=250&apiKey={POLYGON_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-        
+        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
         strikes = {}
-        for c in data.get("results", []):
-            details = c.get("details", {})
-            greeks = c.get("greeks")
-            if not greeks: continue
-            
-            strike = details.get("strike_price", 0)
-            if strike == 0 or abs(strike - live_price) / live_price > 0.10: continue
-            
-            ctype = details.get("contract_type", "").lower()
-            gamma = greeks.get("gamma", 0)
-            oi = c.get("open_interest", 0)
-            
-            contract_gex = gamma * oi * 100
-            if strike not in strikes: strikes[strike] = 0
-            
-            if ctype == "call": strikes[strike] += contract_gex
-            elif ctype == "put": strikes[strike] -= contract_gex
+        pages = 0
+        
+        async with aiohttp.ClientSession() as session:
+            while url and pages < 10:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for c in data.get("results", []):
+                            details = c.get("details", {})
+                            greeks = c.get("greeks")
+                            if not greeks: continue
+                            
+                            strike = details.get("strike_price", 0)
+                            ctype = details.get("contract_type", "").lower()
+                            gamma = greeks.get("gamma", 0)
+                            oi = c.get("open_interest", 0)
+                            
+                            contract_gex = gamma * oi * 100
+                            if strike not in strikes: strikes[strike] = 0
+                            if ctype == "call": strikes[strike] += contract_gex
+                            elif ctype == "put": strikes[strike] -= contract_gex
+                            
+                        next_url = data.get("next_url")
+                        url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
+                        pages += 1
+                    else:
+                        break
         
         gex_data = [{"strike": s, "gex": round(strikes[s])} for s in sorted(strikes.keys())]
         return {"status": "success", "ticker": ticker, "data": gex_data}
@@ -204,38 +225,43 @@ async def get_options_heatmap(ticker: str):
     try:
         stock = await asyncio.to_thread(yf.Ticker, ticker)
         live_price = stock.fast_info['last_price']
+        min_strike, max_strike = live_price * 0.90, live_price * 1.10
         
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?limit=250&apiKey={POLYGON_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                
+        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
         matrix = {}
         expirations = set()
+        pages = 0
         
-        for c in data.get("results", []):
-            details = c.get("details", {})
-            strike = details.get("strike_price", 0)
-            if strike == 0 or abs(strike - live_price) / live_price > 0.05: continue
-            
-            exp = details.get("expiration_date")
-            vol = c.get("day", {}).get("volume", 0)
-            
-            if exp not in expirations: expirations.add(exp)
-            if strike not in matrix: matrix[strike] = {}
-            if exp not in matrix[strike]: matrix[strike][exp] = 0
-            
-            matrix[strike][exp] += vol
+        async with aiohttp.ClientSession() as session:
+            while url and pages < 8:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for c in data.get("results", []):
+                            details = c.get("details", {})
+                            strike = details.get("strike_price", 0)
+                            exp = details.get("expiration_date")
+                            vol = c.get("day", {}).get("volume", 0)
+                            
+                            if exp not in expirations: expirations.add(exp)
+                            if strike not in matrix: matrix[strike] = {}
+                            if exp not in matrix[strike]: matrix[strike][exp] = 0
+                            
+                            matrix[strike][exp] += vol
+                            
+                        next_url = data.get("next_url")
+                        url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
+                        pages += 1
+                    else:
+                        break
             
         sorted_exps = sorted(list(expirations))[:3]
-        
         heatmap_data = []
         for s in sorted(matrix.keys(), reverse=True): 
             row = {"strike": s}
             for i in range(3):
                 exp_key = sorted_exps[i] if i < len(sorted_exps) else None
-                vol = matrix[s].get(exp_key, 0) if exp_key else 0
-                row[f"exp{i+1}"] = vol
+                row[f"exp{i+1}"] = matrix[s].get(exp_key, 0) if exp_key else 0
             heatmap_data.append(row)
             
         return {"status": "success", "ticker": ticker, "data": heatmap_data[:10]}
@@ -244,19 +270,14 @@ async def get_options_heatmap(ticker: str):
 
 @router.get("/api/equities/global_plays")
 async def get_global_plays():
-    """Endpoint for the Global Dashboard to fetch Swings, Leaps, and Day Trades."""
-    file_path = "data/website_global_plays.json"
-    # Fallback to local path if running outside Docker
-    if not os.path.exists(file_path):
-        file_path = "website_global_plays.json"
-        
+    """Serves pre-calculated algorithmic plays instantly to the frontend."""
+    file_path = "latest_scans.json"
     try:
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
                 data = json.load(f)
             return JSONResponse(content={"plays": data.get("plays", [])})
         else:
-            # Return empty list if the file hasn't been created by the bot yet
             return JSONResponse(content={"plays": []})
     except Exception as e:
         print(f"Error reading global plays: {e}")
@@ -265,16 +286,13 @@ async def get_global_plays():
 @router.get("/api/flow/whales")
 async def get_whale_tape():
     """Endpoint for the Whale Flow Marquee to fetch the latest massive options sweeps."""
-    file_path = "data/website_whale_tape.json"
-    # Fallback to local path if running outside Docker
-    if not os.path.exists(file_path):
-        file_path = "website_whale_tape.json"
-        
+    file_path = "latest_scans.json"
     try:
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
                 data = json.load(f)
-            return JSONResponse(content={"tape": data.get("whales", [])})
+            whales = [p for p in data.get("plays", []) if p.get("play_type") in ["LEAP", "WHALE"]]
+            return JSONResponse(content={"tape": whales})
         else:
             return JSONResponse(content={"tape": []})
     except Exception as e:
@@ -335,7 +353,6 @@ async def oracle_query(request: OracleRequest):
     if not POLYGON_KEY or not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="Missing API Keys in Backend.")
 
-    # 1. Fetch the raw tape from Polygon first
     url = f"https://api.polygon.io/v3/snapshot/options/{target_ticker}?limit=250&apiKey={POLYGON_KEY}"
     
     raw_flow_context = ""
@@ -345,7 +362,6 @@ async def oracle_query(request: OracleRequest):
                 if resp.status == 200:
                     chain_data = await resp.json()
                     
-                    # Aggregate the data so we don't blow up Claude's token limit
                     total_call_vol, total_put_vol = 0, 0
                     total_call_oi, total_put_oi = 0, 0
                     
@@ -372,7 +388,6 @@ async def oracle_query(request: OracleRequest):
         print(f"Polygon fetch error: {e}")
         raw_flow_context = "Warning: Live data fetch failed."
 
-    # 2. Inject Polygon Data into Claude Opus 4.7
     client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
     
     sys_prompt = f"""
