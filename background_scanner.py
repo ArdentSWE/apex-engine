@@ -19,36 +19,30 @@ TOP_100_TICKERS = [
     "KO", "CSCO", "IBM", "LIN", "ASML", "PEP", "TMO", "NOW", "DIS", "MCD",
     "INTC", "AMD", "INTU", "QCOM", "TXN", "AMAT", "MU", "PANW", "ADI", "KLAC",
     "LRCX", "SNPS", "CRWD", "FTNT", "PLTR", "SNOW", "ZS", "DDOG", "NET", "TEAM",
-    "SHOP", "WDAY", "MDB", "SQ", "ROKU", "COIN", "PYPL", "HOOD", "MARA", "DKNG"
+    "SHOP", "WDAY", "MDB", "UBER", "ROKU", "COIN", "PYPL", "HOOD", "MARA", "DKNG"
 ]
 
 async def get_technical_trend(ticker: str):
-    """STEP 1: Technical scan using Yahoo Finance (Throttled to avoid IP Bans)."""
+    """STEP 1: Technical scan using Yahoo Finance."""
     try:
         df = await asyncio.to_thread(yf.download, tickers=ticker, period="5d", interval="5m", progress=False)
-        if df.empty or len(df) < 20: 
-            return None
+        if df.empty or len(df) < 20: return None
         
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.droplevel(1)
 
-        # Daily VWAP Calculation
         df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
         df['Vol_Price'] = df['Typical_Price'] * df['Volume']
-        
         df['Date'] = df.index.date
         df['Cum_Vol'] = df.groupby('Date')['Volume'].cumsum()
         df['Cum_Vol_Price'] = df.groupby('Date')['Vol_Price'].cumsum()
         df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
-        
-        # EMA9 Calculation
         df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
 
         close = float(df['Close'].iloc[-1])
         ema9 = float(df['EMA9'].iloc[-1])
         vwap = float(df['VWAP'].iloc[-1])
 
-        # STRICT TREND DEFINITION
         trend = "CHOP"
         if close > ema9 and ema9 > vwap: trend = "BULLISH"
         elif close < ema9 and ema9 < vwap: trend = "BEARISH"
@@ -69,12 +63,14 @@ async def get_options_flow(ticker_data):
     leap_calls, leap_puts = 0, 0
 
     try:
-        min_strike, max_strike = close * 0.75, close * 1.25
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
+        # THE FIX: Tighten bounds to 8% and filter out expired ghost contracts
+        min_strike, max_strike = close * 0.92, close * 1.08
+        today_str = datetime.datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&expiration_date.gte={today_str}&limit=250&apiKey={POLYGON_KEY}"
         pages = 0
 
         async with aiohttp.ClientSession() as session:
-            while url and pages < 10:
+            while url and pages < 15:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -124,10 +120,8 @@ async def get_options_flow(ticker_data):
         return None
 
 async def run_apex_scan():
-    print(f"[{datetime.datetime.now()}] PHASE 1: TECHNICAL TREND SCAN (YAHOO FINANCE)...")
+    print(f"[{datetime.datetime.now()}] PHASE 1: TECHNICAL TREND SCAN...")
     
-    # 1. SCAN ALL TICKERS FOR TECHNICAL TRENDS
-    # STRICT SEMAPHORE: Limit to 5 concurrent YF requests, with a 0.5s pause, to absolutely prevent the IP Ban
     tech_sem = asyncio.Semaphore(5)
     async def safe_tech(t):
         async with tech_sem:
@@ -143,7 +137,6 @@ async def run_apex_scan():
         with open("latest_scans.json", "w") as f: json.dump({"plays": []}, f)
         return
 
-    # 2. SCAN ONLY THE TRENDING TICKERS FOR OPTIONS FLOW
     print(f"\nPHASE 2: CROSS-REFERENCING INSTITUTIONAL FLOW VIA POLYGON...")
     flow_sem = asyncio.Semaphore(10)
     async def safe_flow(data):
@@ -156,11 +149,8 @@ async def run_apex_scan():
 
     day_cands, swing_cands, leap_cands = [], [], []
 
-    # 3. FILTER BY CONVERGENCE (Tech Trend MUST align with Flow Skew)
     for r in confirmed_data:
         trend = r['trend']
-        
-        # Day Trades
         total_day = r['day_calls'] + r['day_puts']
         if total_day > 250000:
             call_skew = r['day_calls'] / total_day
@@ -169,7 +159,6 @@ async def run_apex_scan():
             elif trend == "BEARISH" and call_skew < 0.40:
                 day_cands.append({"ticker": r['ticker'], "score": total_day * (1 - call_skew), "data": r, "dir": "PUTS"})
 
-        # Swing Trades
         total_swing = r['swing_calls'] + r['swing_puts']
         if total_swing > 500000:
             call_skew = r['swing_calls'] / total_swing if total_swing > 0 else 0
@@ -178,7 +167,6 @@ async def run_apex_scan():
             elif trend == "BEARISH" and call_skew < 0.40:
                 swing_cands.append({"ticker": r['ticker'], "score": total_swing * (1 - call_skew), "data": r, "dir": "PUTS"})
 
-        # Leaps
         total_leap = r['leap_calls'] + r['leap_puts']
         if total_leap > 1000000:
             call_skew = r['leap_calls'] / total_leap if total_leap > 0 else 0
@@ -196,7 +184,7 @@ async def run_apex_scan():
         with open("latest_scans.json", "w") as f: json.dump({"plays": []}, f)
         return
 
-    print(f"\n[SCAN COMPLETE] Tech & Flow Converged on {len(top_days)} Day Trades, {len(top_swings)} Swings, and {len(top_leaps)} Whales. Generating UI Payload...")
+    print(f"\n[SCAN COMPLETE] Tech & Flow Converged on {len(top_days)} Day Trades, {len(top_swings)} Swings, and {len(top_leaps)} Whales. Generating Payload...")
 
     context_data = f"--- DAY TRADES ---\n{top_days}\n--- SWINGS ---\n{top_swings}\n--- LEAPS ---\n{top_leaps}"
 
@@ -206,7 +194,7 @@ async def run_apex_scan():
     The technicals (Price, EMA9, VWAP) ALIGN perfectly with the directional options flow.
     DO NOT guess the direction, strictly use the "dir" (CALLS or PUTS) provided.
     
-    In your thesis, briefly mention the flow and the chart confirmation (e.g. "Massive call flow detected as price breaks above VWAP").
+    In your thesis, briefly mention the flow and the chart confirmation.
     
     Raw Telemetry:
     {context_data}
