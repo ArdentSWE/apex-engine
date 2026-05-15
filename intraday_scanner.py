@@ -6,15 +6,14 @@ import json
 import re
 import aiohttp
 import pandas as pd
-import yfinance as yf
 from anthropic import AsyncAnthropic
-import logging
-
-# Mute yfinance background noise
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 POLYGON_KEY = os.environ.get("POLYGON_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+# 🚀 ALPACA HFT DATA KEYS
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "PKQ5GXEMLUIH5D7W2XVVTSLS5O")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "WfunuBNhpLv7JqiPQVKfxvfAUJZDYzDhoa3DSEbRLVV")
 
 # Focused watchlist for 0DTE / High-Velocity Scalping
 SCALP_WATCHLIST = [
@@ -22,37 +21,72 @@ SCALP_WATCHLIST = [
     "NFLX", "SMCI", "AVGO", "COIN", "MSTR", "PLTR", "ARM", "MU", "QCOM", "BA"
 ]
 
-async def get_intraday_technicals(ticker: str):
-    """STEP 1: Fast Intraday Technical scan using Yahoo Finance."""
+async def get_bulk_alpaca_technicals():
+    """STEP 1: Ultra-fast, single-call bulk request to Alpaca's API."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        print("❌ Missing Alpaca API Keys. Cannot fetch technicals.")
+        return []
+
     try:
-        df = await asyncio.to_thread(yf.download, tickers=ticker, period="2d", interval="5m", progress=False)
-        if df.empty or len(df) < 10: 
-            return None
+        symbols = ",".join(SCALP_WATCHLIST)
+        # Limit 500 gives us ~1.5 days of 5m candles, plenty for EMA9 and Daily VWAP
+        url = f"https://data.alpaca.markets/v2/stocks/bars?symbols={symbols}&timeframe=5Min&limit=500&feed=iex"
         
-        if isinstance(df.columns, pd.MultiIndex): 
-            df.columns = df.columns.droplevel(1)
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY.strip(),
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY.strip()
+        }
 
-        # Daily VWAP Calculation
-        df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
-        df['Vol_Price'] = df['Typical_Price'] * df['Volume']
-        df['Date'] = df.index.date
-        df['Cum_Vol'] = df.groupby('Date')['Volume'].cumsum()
-        df['Cum_Vol_Price'] = df.groupby('Date')['Vol_Price'].cumsum()
-        df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
-        df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    print(f"Alpaca API Error: {err}")
+                    return []
+                data = await resp.json()
+                bars = data.get("bars", {})
 
-        close_px = float(df['Close'].iloc[-1])
-        ema9 = float(df['EMA9'].iloc[-1])
-        vwap = float(df['VWAP'].iloc[-1])
+        trending_tickers = []
 
-        # INTRADAY TREND DEFINITION
-        trend = "CHOP"
-        if close_px > ema9 and ema9 > vwap: trend = "BULLISH"
-        elif close_px < ema9 and ema9 < vwap: trend = "BEARISH"
+        # Process all tickers instantly in memory
+        for ticker, ticker_bars in bars.items():
+            if not ticker_bars or len(ticker_bars) < 20: continue
 
-        return {"ticker": ticker, "close": close_px, "ema9": ema9, "vwap": vwap, "trend": trend}
+            df = pd.DataFrame(ticker_bars)
+            df['Time'] = pd.to_datetime(df['t'])
+            df = df.set_index('Time').tz_convert('America/New_York')
+
+            df['Typical_Price'] = (df['h'] + df['l'] + df['c']) / 3
+            df['Vol_Price'] = df['Typical_Price'] * df['v']
+            df['Date'] = df.index.date
+            
+            # Daily VWAP Reset
+            df['Cum_Vol'] = df.groupby('Date')['v'].cumsum()
+            df['Cum_Vol_Price'] = df.groupby('Date')['Vol_Price'].cumsum()
+            df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
+            df['EMA9'] = df['c'].ewm(span=9, adjust=False).mean()
+
+            close_px = float(df['c'].iloc[-1])
+            ema9 = float(df['EMA9'].iloc[-1])
+            vwap = float(df['VWAP'].iloc[-1])
+
+            # INTRADAY TREND DEFINITION
+            trend = "CHOP"
+            if close_px > ema9 and ema9 > vwap: trend = "BULLISH"
+            elif close_px < ema9 and ema9 < vwap: trend = "BEARISH"
+
+            if trend != "CHOP":
+                trending_tickers.append({
+                    "ticker": ticker, 
+                    "close": close_px, 
+                    "trend": trend
+                })
+
+        return trending_tickers
+
     except Exception as e:
-        return None
+        print(f"Bulk Alpaca Processing Error: {e}")
+        return []
 
 async def get_0dte_flow(ticker_data):
     """STEP 2: Hits Polygon strictly for 0DTE to 7DTE options flow."""
@@ -64,14 +98,12 @@ async def get_0dte_flow(ticker_data):
     day_calls, day_puts = 0, 0
 
     try:
-        # TIGHT BOUNDS: +/- 5% Strike range to capture only ATM/Near-OTM flow
+        # TIGHT BOUNDS: +/- 5% Strike range
         min_strike, max_strike = close_px * 0.95, close_px * 1.05
-        
         now_pt = datetime.datetime.now(pytz.timezone('America/New_York'))
         today_str = now_pt.strftime('%Y-%m-%d')
         week_out_str = (now_pt + datetime.timedelta(days=7)).strftime('%Y-%m-%d')
         
-        # POLGYON API FILTER: Only fetch contracts expiring between today and +7 days
         url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&expiration_date.gte={today_str}&expiration_date.lte={week_out_str}&limit=250&apiKey={POLYGON_KEY}"
         pages = 0
 
@@ -97,7 +129,6 @@ async def get_0dte_flow(ticker_data):
                             exp_date = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
                             dte = (exp_date - now_pt.date()).days
 
-                            # Strict 0-7 DTE bucket
                             if 0 <= dte <= 7:
                                 if ctype == 'call': day_calls += prem
                                 else: day_puts += prem
@@ -110,10 +141,7 @@ async def get_0dte_flow(ticker_data):
                     else:
                         break
 
-        ticker_data.update({
-            "day_calls": day_calls, 
-            "day_puts": day_puts,
-        })
+        ticker_data.update({"day_calls": day_calls, "day_puts": day_puts})
         return ticker_data
         
     except Exception as e:
@@ -123,22 +151,18 @@ async def get_0dte_flow(ticker_data):
 async def run_intraday_scan():
     print(f"[{datetime.datetime.now()}] ⚡ INITIATING 0DTE/WEEKLY SCALP SCAN...")
     
-    # PHASE 1
-    tech_sem = asyncio.Semaphore(5)
-    async def safe_tech(t):
-        async with tech_sem:
-            await asyncio.sleep(0.3) 
-            return await get_intraday_technicals(t)
-            
-    tech_results = await asyncio.gather(*[safe_tech(t) for t in SCALP_WATCHLIST])
-    trending_tickers = [r for r in tech_results if r is not None and r['trend'] != "CHOP"]
+    # PHASE 1: BULK ALPACA FETCH
+    print("📡 Fetching bulk IEX data from Alpaca...")
+    trending_tickers = await get_bulk_alpaca_technicals()
     
     if not trending_tickers:
         print("Market is chopping. No Intraday setups found.")
         return
+        
+    print(f"✅ Found {len(trending_tickers)} tickers in confirmed intraday trends.")
 
-    # PHASE 2
-    print(f"\n📡 CROSS-REFERENCING {len(trending_tickers)} TICKERS WITH 0DTE FLOW...")
+    # PHASE 2: POLYGON FLOW VERIFICATION
+    print(f"\n📡 CROSS-REFERENCING TICKERS WITH 0DTE FLOW...")
     flow_sem = asyncio.Semaphore(10)
     async def safe_flow(data):
         async with flow_sem:
@@ -160,10 +184,10 @@ async def run_intraday_scan():
             call_skew = r['day_calls'] / total_day
             if trend == "BULLISH" and call_skew > 0.60:
                 print(f"[{t}] 0DTE CALLS | Flow: ${total_day/1000000:.1f}M | Skew: {call_skew*100:.1f}%")
-                candidates.append({"ticker": t, "type": "0DTE SCALP", "dir": "CALLS", "flow": total_day, "skew": call_skew, "trend": trend})
+                candidates.append({"ticker": t, "play_type": "0DTE SCALP", "direction": "CALLS", "flow": total_day, "skew": call_skew, "trend": trend})
             elif trend == "BEARISH" and call_skew < 0.40:
                 print(f"[{t}] 0DTE PUTS | Flow: ${total_day/1000000:.1f}M | Skew: {(1-call_skew)*100:.1f}%")
-                candidates.append({"ticker": t, "type": "0DTE SCALP", "dir": "PUTS", "flow": total_day, "skew": 1-call_skew, "trend": trend})
+                candidates.append({"ticker": t, "play_type": "0DTE SCALP", "direction": "PUTS", "flow": total_day, "skew": 1-call_skew, "trend": trend})
 
     if not candidates:
         print("\nFlow not confirming. Aborting.")
@@ -175,13 +199,11 @@ async def run_intraday_scan():
 
     market_context = []
     for c in best_plays:
-        market_context.append(f"[{c['ticker']}] Type: {c['type']} | Trend: {c['trend']} | Flow: ${c['flow']/1000000:.1f}M | Skew: {c['skew']*100:.1f}% {c['dir']}")
+        market_context.append(f"[{c['ticker']}] Type: {c['play_type']} | Trend: {c['trend']} | Flow: ${c['flow']/1000000:.1f}M | Skew: {c['skew']*100:.1f}% {c['direction']}")
 
     print(f"\n🧠 PASSING TO APEX QUANT ENGINE...")
     
-    # -----------------------------------------------------
-    # PHASE 4: THE APEX MASTER PROMPT (ANTI-HALLUCINATION)
-    # -----------------------------------------------------
+    # PHASE 4: THE APEX MASTER PROMPT
     client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
     now_str = datetime.datetime.now(pytz.timezone('America/Los_Angeles')).strftime('%Y-%m-%d %I:%M %p PT')
 
@@ -197,9 +219,9 @@ async def run_intraday_scan():
 
     🚨 CRITICAL ANTI-HALLUCINATION PROTOCOL 🚨
     You are strictly forbidden from inventing, guessing, or hallucinating financial data. You do not have access to live option chain pricing. 
-    1. STRIKE PRICE: You MUST output "ATM" (At-The-Money) or "First OTM". Do not invent a specific dollar strike (e.g., $155C).
+    1. STRIKE PRICE: You MUST output "ATM" (At-The-Money) or "First OTM". Do not invent a specific dollar strike.
     2. EXPIRATION: You MUST output "0DTE" (for Day Trades) or "Front-Week" (for Swings). Do not guess the exact calendar date.
-    3. SL & TP: Do NOT invent arbitrary dollar amounts for entry or exit (e.g., "Enter at $1.50, Stop at $1.20"). You MUST use algorithmic or percentage-based risk management rules (e.g., "SL: -20% or 5m close below VWAP").
+    3. SL & TP: Do NOT invent arbitrary dollar amounts for entry or exit. You MUST use algorithmic or percentage-based risk management rules (e.g., "SL: -20% or 5m close below VWAP").
 
     [YOUR DIRECTIVE]
     Output exactly ONE high-probability trade idea based on the provided telemetry. 
@@ -210,7 +232,7 @@ async def run_intraday_scan():
         "play_type": "String (Must be '0DTE SCALP' or 'WEEKLY SWING')",
         "trend": "String (e.g., BULLISH or BEARISH)",
         "direction": "String (CALLS or PUTS)",
-        "confidence": "Integer (80-99)",
+        "confidence": 95,
         "strike": "String (Strictly 'ATM' or 'First OTM')",
         "expiration": "String (Strictly '0DTE' or 'Front-Week')",
         "sl": "String (e.g., '-20% Premium or Trend Invalidation')",
@@ -233,7 +255,6 @@ async def run_intraday_scan():
         
         parsed_data = json.loads(clean_json)
         
-        # Save isolated 0DTE scans (so they don't overwrite Swings/Leaps)
         with open("latest_0dte_scans.json", "w") as f:
             json.dump({"plays": [parsed_data]}, f, indent=4)
             
