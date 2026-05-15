@@ -272,27 +272,42 @@ async def get_options_heatmap(ticker: str):
 
 @router.get("/api/equities/global_plays")
 async def get_global_plays():
-    file_path = "latest_scans.json"
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, "r") as f:
+    combined_plays = []
+    
+    # 1. Pull Swings & LEAPs
+    if os.path.exists("latest_scans.json"):
+        try:
+            with open("latest_scans.json", "r") as f:
                 data = json.load(f)
-            return JSONResponse(content={"plays": data.get("plays", [])})
-        else:
-            return JSONResponse(content={"plays": []})
-    except Exception as e:
-        print(f"Error reading global plays: {e}")
-        return JSONResponse(content={"plays": []}, status_code=500)
+                combined_plays.extend(data.get("plays", []))
+        except: pass
+
+    # 2. Pull 0DTE & Weekly Scalps
+    if os.path.exists("latest_0dte_scans.json"):
+        try:
+            with open("latest_0dte_scans.json", "r") as f:
+                data = json.load(f)
+                combined_plays.extend(data.get("plays", []))
+        except: pass
+
+    # 3. Pull Manual Discord Bot Overrides
+    if os.path.exists("website_global_plays.json"):
+        try:
+            with open("website_global_plays.json", "r") as f:
+                data = json.load(f)
+                combined_plays.extend(data.get("plays", []))
+        except: pass
+
+    return JSONResponse(content={"plays": combined_plays})
 
 @router.get("/api/flow/whales")
 async def get_whale_tape():
-    file_path = "latest_scans.json"
+    file_path = "website_whale_tape.json"
     try:
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
                 data = json.load(f)
-            whales = [p for p in data.get("plays", []) if p.get("play_type") in ["LEAP", "WHALE"]]
-            return JSONResponse(content={"tape": whales})
+            return JSONResponse(content={"tape": data.get("whales", [])})
         else:
             return JSONResponse(content={"tape": []})
     except Exception as e:
