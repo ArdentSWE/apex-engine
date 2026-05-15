@@ -22,174 +22,194 @@ TOP_100_TICKERS = [
     "SHOP", "WDAY", "MDB", "SQ", "ROKU", "COIN", "PYPL", "HOOD", "MARA", "DKNG"
 ]
 
-def fetch_spy_baseline():
-    """Fetches the SPY 5-day return to calculate Relative Strength Divergence."""
+async def get_technical_trend(ticker: str):
+    """STEP 1: Fast, free technical scan using VWAP and EMA9 to confirm momentum."""
     try:
-        spy = yf.Ticker("SPY").history(period="5d")
-        if len(spy) >= 5:
-            return (spy['Close'].iloc[-1] - spy['Close'].iloc[0]) / spy['Close'].iloc[0]
-    except Exception:
-        pass
-    return 0.0
+        df = await asyncio.to_thread(yf.download, tickers=ticker, period="5d", interval="5m", progress=False)
+        if df.empty or len(df) < 20: return None
+        
+        # Handle multi-index columns from yfinance update
+        if isinstance(df.columns, pd.MultiIndex): 
+            df.columns = df.columns.droplevel(1)
 
-async def compute_institutional_metrics(ticker: str, spy_5d_return: float):
-    """Calculates SMC, Gamma Exposure, RS Divergence, and Delta Replacement."""
+        # Calculate VWAP
+        df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
+        df['Cum_Vol'] = df['Volume'].cumsum()
+        df['Cum_Vol_Price'] = (df['Typical_Price'] * df['Volume']).cumsum()
+        df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
+        
+        # Calculate EMA9
+        df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
+
+        close = float(df['Close'].iloc[-1])
+        ema9 = float(df['EMA9'].iloc[-1])
+        vwap = float(df['VWAP'].iloc[-1])
+
+        # STRICT TREND DEFINITION
+        trend = "CHOP"
+        if close > ema9 and ema9 > vwap: trend = "BULLISH"
+        elif close < ema9 and ema9 < vwap: trend = "BEARISH"
+
+        return {"ticker": ticker, "close": close, "ema9": ema9, "vwap": vwap, "trend": trend}
+    except Exception as e:
+        return None
+
+async def get_options_flow(ticker_data):
+    """STEP 2: Only hits Polygon for stocks in a confirmed trend to verify institutional backing."""
+    if not POLYGON_KEY: return None
+    
+    ticker = ticker_data['ticker']
+    close = ticker_data['close']
+
+    day_calls, day_puts = 0, 0
+    swing_calls, swing_puts = 0, 0
+    leap_calls, leap_puts = 0, 0
+
     try:
-        stock = await asyncio.to_thread(yf.Ticker, ticker)
-        hist = stock.history(period="90d")
-        if hist.empty or len(hist) < 30: return None
-        
-        close = hist['Close'].iloc[-1]
-        
-        # 1. SMC: Order Blocks & POC
-        hist['Price_Bins'] = pd.cut(hist['Close'], bins=30)
-        vol_profile = hist.groupby('Price_Bins', observed=False)['Volume'].sum()
-        poc_price = vol_profile.idxmax().mid
-        
-        recent = hist.tail(30).copy()
-        recent['Return'] = recent['Close'].pct_change()
-        best_day_loc = recent.index.get_loc(recent['Return'].idxmax())
-        bullish_ob = recent.iloc[best_day_loc - 1]['Low'] if best_day_loc > 0 and recent.iloc[best_day_loc - 1]['Close'] < recent.iloc[best_day_loc - 1]['Open'] else 0
+        min_strike, max_strike = close * 0.75, close * 1.25
+        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
+        pages = 0
 
-        # 2. RS Divergence (Relative Strength)
-        ticker_5d_return = (hist['Close'].iloc[-1] - hist['Close'].iloc[-5]) / hist['Close'].iloc[-5] if len(hist) >= 5 else 0
-        rs_divergence = True if (spy_5d_return < -0.005 and ticker_5d_return > 0.01) else False
-            
-        # 3. Polygon Live Flow & Market Mechanics
-        day_call_flow, day_put_flow = 0, 0
-        swing_call_flow, swing_put_flow = 0, 0
-        deep_itm_whale_flow = 0
-        near_money_gamma = 0
-        
-        if POLYGON_KEY:
-            min_strike, max_strike = close * 0.85, close * 1.15
-            url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
-            pages = 0
-            
-            async with aiohttp.ClientSession() as session:
-                while url and pages < 10:
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            for c in data.get("results", []):
-                                details = c.get('details', {})
-                                ctype = details.get('contract_type', '').lower()
-                                strike = details.get('strike_price', 0)
-                                exp_str = details.get('expiration_date', '')
-                                
-                                vol = c.get('day', {}).get('volume', 0)
-                                vwap = c.get('day', {}).get('vwap', 0)
-                                oi = c.get('open_interest', 0)
-                                greeks = c.get('greeks')
-                                
-                                if not exp_str or vol == 0 or not greeks: continue
-                                
-                                prem = vol * vwap * 100
-                                delta = abs(greeks.get('delta', 0))
-                                gamma = greeks.get('gamma', 0)
-                                
-                                exp_date = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
-                                dte = (exp_date - datetime.date.today()).days
-                                
-                                # A. DAY TRADE LOGIC (0-7 DTE & Gamma Squeeze)
-                                if dte <= 7:
-                                    if ctype == 'call': day_call_flow += prem
-                                    else: day_put_flow += prem
-                                    
-                                    # Calculate Market Maker Hedging exposure near the money (within 5%)
-                                    if abs(strike - close) / close < 0.05:
-                                        contract_gex = gamma * oi * 100
-                                        near_money_gamma += contract_gex if ctype == 'call' else -contract_gex
+        async with aiohttp.ClientSession() as session:
+            while url and pages < 10:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for c in data.get("results", []):
+                            details = c.get('details', {})
+                            ctype = details.get('contract_type', '').lower()
+                            exp_str = details.get('expiration_date', '')
 
-                                # B. SWING LOGIC (30-90 DTE)
-                                elif 30 <= dte <= 90:
-                                    if ctype == 'call': swing_call_flow += prem
-                                    else: swing_put_flow += prem
-                                    
-                                # C. LEAP / WHALE LOGIC (>180 DTE & Deep ITM Delta)
-                                elif dte >= 180 and delta >= 0.80 and ctype == 'call':
-                                    deep_itm_whale_flow += prem
-                                    
-                            next_url = data.get("next_url")
-                            url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
-                            pages += 1
-                        else:
-                            break
+                            # Fallback logic: Use OI if intraday volume is missing
+                            vol = c.get('day', {}).get('volume', 0)
+                            if vol == 0: vol = c.get('open_interest', 0)
                             
-        return {
-            "ticker": ticker, "close": round(close, 2), "poc": round(poc_price, 2), "bullish_ob": round(bullish_ob, 2), 
-            "rs_divergence": rs_divergence, "near_money_gamma": near_money_gamma,
-            "day_call": day_call_flow, "day_put": day_put_flow,
-            "swing_call": swing_call_flow, "swing_put": swing_put_flow,
-            "deep_itm_whale": deep_itm_whale_flow
-        }
+                            # Fallback logic: Use Ask if VWAP is missing
+                            vwap = c.get('day', {}).get('vwap', 0)
+                            price = vwap if vwap > 0 else c.get('last_quote', {}).get('ask', 0)
+
+                            if not exp_str or vol == 0 or price == 0: continue
+
+                            prem = vol * price * 100
+                            exp_date = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+                            dte = (exp_date - datetime.date.today()).days
+
+                            # Bucket the flow by Timeframe
+                            if dte <= 7:
+                                if ctype == 'call': day_calls += prem
+                                else: day_puts += prem
+                            elif 8 <= dte <= 90:
+                                if ctype == 'call': swing_calls += prem
+                                else: swing_puts += prem
+                            elif dte > 90:
+                                if ctype == 'call': leap_calls += prem
+                                else: leap_puts += prem
+
+                        next_url = data.get("next_url")
+                        url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
+                        pages += 1
+                    elif resp.status == 429:
+                        await asyncio.sleep(5) # API Rate Limit Pause
+                    else:
+                        break
+
+        ticker_data.update({
+            "day_calls": day_calls, "day_puts": day_puts,
+            "swing_calls": swing_calls, "swing_puts": swing_puts,
+            "leap_calls": leap_calls, "leap_puts": leap_puts
+        })
+        return ticker_data
+        
     except Exception as e:
         return None
 
 async def run_apex_scan():
-    print(f"[{datetime.datetime.now()}] INITIATING MULTI-STRATEGY APEX SCAN...")
+    print(f"[{datetime.datetime.now()}] PHASE 1: INITIATING TECHNICAL TREND SCAN...")
     
-    spy_5d_return = fetch_spy_baseline()
-    print(f"Macro Baseline: SPY 5D Return = {spy_5d_return * 100:.2f}%")
+    # 1. SCAN ALL TICKERS FOR TECHNICAL TRENDS (Fast & Free)
+    tech_sem = asyncio.Semaphore(20)
+    async def safe_tech(t):
+        async with tech_sem:
+            return await get_technical_trend(t)
+            
+    tech_results = await asyncio.gather(*[safe_tech(t) for t in TOP_100_TICKERS])
+    trending_tickers = [r for r in tech_results if r is not None and r['trend'] != "CHOP"]
     
-    sem = asyncio.Semaphore(50) 
-    async def safe_compute(t):
-        async with sem:
-            return await compute_institutional_metrics(t, spy_5d_return)
+    print(f"Found {len(trending_tickers)} tickers in confirmed mechanical trends. Discarding the chop.")
+    if not trending_tickers:
+        print("Market is completely flat. No setups found.")
+        with open("latest_scans.json", "w") as f: json.dump({"plays": []}, f)
+        return
 
-    results = await asyncio.gather(*[safe_compute(t) for t in TOP_100_TICKERS])
-    valid_data = [r for r in results if r is not None]
+    # 2. SCAN ONLY THE TRENDING TICKERS FOR OPTIONS FLOW
+    print(f"\nPHASE 2: CROSS-REFERENCING INSTITUTIONAL FLOW...")
+    flow_sem = asyncio.Semaphore(10)
+    async def safe_flow(data):
+        async with flow_sem:
+            await asyncio.sleep(0.2)
+            return await get_options_flow(data)
+            
+    flow_results = await asyncio.gather(*[safe_flow(d) for d in trending_tickers])
+    confirmed_data = [r for r in flow_results if r is not None]
 
     day_cands, swing_cands, leap_cands = [], [], []
 
-    for r in valid_data:
-        # STRATEGY 1: Gamma Squeeze (Day Trades)
-        # Extreme call flow on 0-7DTE + A massive positive Gamma Wall near the money
-        total_day_flow = r['day_call'] + r['day_put']
-        day_call_skew = r['day_call'] / total_day_flow if total_day_flow > 0 else 0
+    # 3. FILTER BY CONVERGENCE (Tech Trend MUST align with Flow Skew)
+    for r in confirmed_data:
+        trend = r['trend']
         
-        if total_day_flow > 1000000 and day_call_skew > 0.65 and r['near_money_gamma'] > 50000:
-            score = (total_day_flow * day_call_skew) + r['near_money_gamma']
-            day_cands.append({"ticker": r['ticker'], "score": score, "data": r, "logic": "Gamma Squeeze"})
+        # Day Trades
+        total_day = r['day_calls'] + r['day_puts']
+        if total_day > 250000:
+            call_skew = r['day_calls'] / total_day
+            if trend == "BULLISH" and call_skew > 0.60:
+                day_cands.append({"ticker": r['ticker'], "score": total_day * call_skew, "data": r, "dir": "CALLS"})
+            elif trend == "BEARISH" and call_skew < 0.40:
+                day_cands.append({"ticker": r['ticker'], "score": total_day * (1 - call_skew), "data": r, "dir": "PUTS"})
 
-        # STRATEGY 2: Swing Accumulation
-        # Catches either traditional SMC Order Block bounces OR Relative Strength Divergence
-        total_swing_flow = r['swing_call'] + r['swing_put']
-        swing_call_skew = r['swing_call'] / total_swing_flow if total_swing_flow > 0 else 0
-        
-        if total_swing_flow > 1500000 and swing_call_skew > 0.60:
-            is_ob_bounce = r['bullish_ob'] > 0 and abs(r['close'] - r['bullish_ob']) / r['bullish_ob'] < 0.04
-            if is_ob_bounce or r['rs_divergence']:
-                logic_str = "RS Divergence" if r['rs_divergence'] else "SMC Order Block"
-                swing_cands.append({"ticker": r['ticker'], "score": total_swing_flow, "data": r, "logic": logic_str})
+        # Swing Trades
+        total_swing = r['swing_calls'] + r['swing_puts']
+        if total_swing > 500000:
+            call_skew = r['swing_calls'] / total_swing if total_swing > 0 else 0
+            if trend == "BULLISH" and call_skew > 0.60:
+                swing_cands.append({"ticker": r['ticker'], "score": total_swing * call_skew, "data": r, "dir": "CALLS"})
+            elif trend == "BEARISH" and call_skew < 0.40:
+                swing_cands.append({"ticker": r['ticker'], "score": total_swing * (1 - call_skew), "data": r, "dir": "PUTS"})
 
-        # STRATEGY 3: Deep ITM Stock Replacement
-        # Catches >0.80 Delta Whale leaps. We don't care about puts, only institutional equity replacement.
-        if r['deep_itm_whale'] > 3000000: 
-            leap_cands.append({"ticker": r['ticker'], "score": r['deep_itm_whale'], "data": r, "logic": "0.80+ Delta Replacement"})
+        # Leaps
+        total_leap = r['leap_calls'] + r['leap_puts']
+        if total_leap > 1000000:
+            call_skew = r['leap_calls'] / total_leap if total_leap > 0 else 0
+            if trend == "BULLISH" and call_skew > 0.60:
+                leap_cands.append({"ticker": r['ticker'], "score": total_leap * call_skew, "data": r, "dir": "CALLS"})
+            elif trend == "BEARISH" and call_skew < 0.40:
+                leap_cands.append({"ticker": r['ticker'], "score": total_leap * (1 - call_skew), "data": r, "dir": "PUTS"})
 
-    top_days = [{"ticker": c['ticker'], "logic": c['logic'], "metrics": c['data']} for c in sorted(day_cands, key=lambda x: x['score'], reverse=True)[:10]]
-    top_swings = [{"ticker": c['ticker'], "logic": c['logic'], "metrics": c['data']} for c in sorted(swing_cands, key=lambda x: x['score'], reverse=True)[:10]]
-    top_leaps = [{"ticker": c['ticker'], "logic": c['logic'], "metrics": c['data']} for c in sorted(leap_cands, key=lambda x: x['score'], reverse=True)[:10]]
+    top_days = [{"ticker": c['ticker'], "dir": c['dir'], "metrics": c['data']} for c in sorted(day_cands, key=lambda x: x['score'], reverse=True)[:6]]
+    top_swings = [{"ticker": c['ticker'], "dir": c['dir'], "metrics": c['data']} for c in sorted(swing_cands, key=lambda x: x['score'], reverse=True)[:6]]
+    top_leaps = [{"ticker": c['ticker'], "dir": c['dir'], "metrics": c['data']} for c in sorted(leap_cands, key=lambda x: x['score'], reverse=True)[:6]]
     
     if not top_days and not top_swings and not top_leaps:
-        print("\nScan complete. No high-conviction mechanical setups found.")
+        print("\nScan complete. Tech is trending, but Flow isn't confirming. Writing empty schema.")
+        with open("latest_scans.json", "w") as f: json.dump({"plays": []}, f)
         return
 
-    print(f"\n[SCAN COMPLETE] Found {len(top_days)} Gamma Squeezes, {len(top_swings)} Swing Accumulations, and {len(top_leaps)} Delta Whales.")
+    print(f"\n[SCAN COMPLETE] Tech & Flow Converged on {len(top_days)} Day Trades, {len(top_swings)} Swings, and {len(top_leaps)} Whales. Generating UI Payload...")
 
-    context_data = f"--- DAY TRADES (GAMMA SQUEEZE) ---\n{top_days}\n--- SWINGS (RS DIVERGENCE / SMC) ---\n{top_swings}\n--- LEAPS (DELTA REPLACEMENT) ---\n{top_leaps}"
+    context_data = f"--- DAY TRADES ---\n{top_days}\n--- SWINGS ---\n{top_swings}\n--- LEAPS ---\n{top_leaps}"
 
+    # 4. SEND TO CLAUDE FOR FORMATTING
     client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
     sys_prompt = f"""
-    You are the 'Apex Options Desk'. Convert these mathematically verified mechanical setups into the UI JSON payload.
-    For the thesis, explicitly mention the 'logic' provided (e.g., 'Gamma Squeeze triggered by massive market maker hedging', or 'Deep ITM Delta replacement detected').
+    You are the 'Apex Options Desk'. Convert these mathematically verified setups into the UI JSON payload.
+    The technicals (Price, EMA9, VWAP) ALIGN perfectly with the directional options flow.
+    DO NOT guess the direction, strictly use the "dir" (CALLS or PUTS) provided.
     
     Raw Telemetry:
     {context_data}
     
     Return ONLY a JSON object with a "plays" array containing objects with: 
-    ticker, play_type (DAY TRADE, SWING, or LEAP), direction (CALLS), confidence (88-99), strike, expiration, thesis.
+    ticker, play_type (DAY TRADE, SWING, or LEAP), direction (CALLS or PUTS), confidence (88-99), strike, expiration, thesis.
     """
     
     try:
@@ -198,13 +218,14 @@ async def run_apex_scan():
             system=sys_prompt, messages=[{"role": "user", "content": "Generate JSON."}]
         )
         raw_text = next((b.text for b in res.content if getattr(b, 'type', '') == 'text'), "").strip()
-        clean_json = re.sub(r'```json\n|```', '', raw_text).strip()
-        parsed_data = json.loads(clean_json)
-        
-        with open("latest_scans.json", "w") as f:
-            json.dump(parsed_data, f, indent=4)
-        print(f"✅ Mission Accomplished. latest_scans.json populated with Mechanical logic.")
-            
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            parsed_data = json.loads(match.group())
+            with open("latest_scans.json", "w") as f:
+                json.dump(parsed_data, f, indent=4)
+            print(f"✅ Mission Accomplished. latest_scans.json populated with {len(parsed_data.get('plays', []))} validated plays.")
+        else:
+            print("Failed to parse JSON.")
     except Exception as e:
         print(f"Anthropic / JSON Error: {e}")
 
