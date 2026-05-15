@@ -54,41 +54,42 @@ async def compute_smc_data(ticker: str):
         best_day_loc = recent.index.get_loc(recent['Return'].idxmax())
         worst_day_loc = recent.index.get_loc(recent['Return'].idxmin())
         
-        bullish_ob = 0
-        bearish_ob = float('inf')
-        
-        if best_day_loc > 0:
-            ob_candle = recent.iloc[best_day_loc - 1]
-            if ob_candle['Close'] < ob_candle['Open']: bullish_ob = ob_candle['Low']
-        if worst_day_loc > 0:
-            ob_candle = recent.iloc[worst_day_loc - 1]
-            if ob_candle['Close'] > ob_candle['Open']: bearish_ob = ob_candle['High']
+        bullish_ob = recent.iloc[best_day_loc - 1]['Low'] if best_day_loc > 0 and recent.iloc[best_day_loc - 1]['Close'] < recent.iloc[best_day_loc - 1]['Open'] else 0
+        bearish_ob = recent.iloc[worst_day_loc - 1]['High'] if worst_day_loc > 0 and recent.iloc[worst_day_loc - 1]['Close'] > recent.iloc[worst_day_loc - 1]['Open'] else float('inf')
             
-        # 3. Polygon Live Flow & Gamma (With Bounding)
+        # 3. Polygon Live Flow & Gamma (With Bounding & Pagination)
         call_prem, put_prem, net_gamma = 0, 0, 0
         if POLYGON_KEY:
-            min_strike, max_strike = close * 0.85, close * 1.15
+            min_strike, max_strike = close * 0.75, close * 1.25
             url = f"https://api.polygon.io/v3/snapshot/options/{ticker}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
+            pages = 0
             
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for c in data.get("results", []):
-                            ctype = c.get('details', {}).get('contract_type', '').lower()
-                            oi = c.get('open_interest', 0)
-                            vol = c.get('day', {}).get('volume', 0)
-                            vwap = c.get('day', {}).get('vwap', 0)
+                while url and pages < 10:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for c in data.get("results", []):
+                                ctype = c.get('details', {}).get('contract_type', '').lower()
+                                oi = c.get('open_interest', 0)
+                                vol = c.get('day', {}).get('volume', 0)
+                                vwap = c.get('day', {}).get('vwap', 0)
+                                
+                                prem = vol * vwap * 100
+                                if ctype == 'call': call_prem += prem
+                                elif ctype == 'put': put_prem += prem
+                                
+                                greeks = c.get("greeks")
+                                if greeks and oi > 100:
+                                    gex = greeks.get('gamma', 0) * oi * 100
+                                    if ctype == 'call': net_gamma += gex
+                                    else: net_gamma -= gex
                             
-                            prem = vol * vwap * 100
-                            if ctype == 'call': call_prem += prem
-                            elif ctype == 'put': put_prem += prem
-                            
-                            greeks = c.get("greeks")
-                            if greeks and oi > 100:
-                                gex = greeks.get('gamma', 0) * oi * 100
-                                if ctype == 'call': net_gamma += gex
-                                else: net_gamma -= gex
+                            next_url = data.get("next_url")
+                            url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
+                            pages += 1
+                        else:
+                            break
         
         return {
             "ticker": ticker,
@@ -129,7 +130,7 @@ async def get_options_flow(ticker: str = "SPY"):
     try:
         stock = await asyncio.to_thread(yf.Ticker, ticker)
         live_price = stock.fast_info['last_price']
-        min_strike, max_strike = live_price * 0.85, live_price * 1.15
+        min_strike, max_strike = live_price * 0.75, live_price * 1.25
         
         url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
         flow_list = []
@@ -182,7 +183,7 @@ async def get_gamma_exposure(ticker: str):
     try:
         stock = await asyncio.to_thread(yf.Ticker, ticker)
         live_price = stock.fast_info['last_price']
-        min_strike, max_strike = live_price * 0.85, live_price * 1.15
+        min_strike, max_strike = live_price * 0.75, live_price * 1.25
         
         url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?strike_price.gte={min_strike}&strike_price.lte={max_strike}&limit=250&apiKey={POLYGON_KEY}"
         strikes = {}
@@ -334,8 +335,8 @@ async def get_ticker_idea(ticker: str):
         )
         
         raw_text = next((b.text for b in res.content if getattr(b, 'type', '') == 'text'), "").strip()
-        clean_json = re.sub(r'```json\n|```', '', raw_text).strip()
-        idea = json.loads(clean_json)
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        idea = json.loads(match.group()) if match else None
         return {"idea": idea}
     except Exception as e:
         return {"error": str(e), "idea": None}
