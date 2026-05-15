@@ -505,5 +505,137 @@ async def predict_game(team1: str, team2: str, sport: str = "NBA", market: str =
         return {"result_text": final_text}
     except Exception as e:
         return {"result_text": f"❌ Data Processing Error: {str(e)}"}
+    
+import json
+import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+
+# Add these alongside your existing endpoints
+
+@app.get("/api/equities/global_plays")
+async def get_global_plays():
+    """Endpoint for the Global Dashboard to fetch Swings, Leaps, and Day Trades."""
+    file_path = "data/website_global_plays.json"
+    # Fallback to local path if running outside Docker
+    if not os.path.exists(file_path):
+        file_path = "website_global_plays.json"
+        
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            return JSONResponse(content={"plays": data.get("plays", [])})
+        else:
+            # Return empty list if the file hasn't been created by the bot yet
+            return JSONResponse(content={"plays": []})
+    except Exception as e:
+        print(f"Error reading global plays: {e}")
+        return JSONResponse(content={"plays": []}, status_code=500)
+
+@app.get("/api/flow/whales")
+async def get_whale_tape():
+    """Endpoint for the Whale Flow Marquee to fetch the latest massive options sweeps."""
+    file_path = "data/website_whale_tape.json"
+    # Fallback to local path if running outside Docker
+    if not os.path.exists(file_path):
+        file_path = "website_whale_tape.json"
+        
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            return JSONResponse(content={"tape": data.get("whales", [])})
+        else:
+            return JSONResponse(content={"tape": []})
+    except Exception as e:
+        print(f"Error reading whale tape: {e}")
+        return JSONResponse(content={"tape": []}, status_code=500)
+    
+from pydantic import BaseModel
+import aiohttp
+from anthropic import AsyncAnthropic
+
+class OracleRequest(BaseModel):
+    prompt: str
+    ticker: str = "SPY"
+
+@app.post("/api/oracle/query")
+async def oracle_query(request: OracleRequest):
+    """Intercepts user queries, fetches live Polygon data, and routes to Claude."""
+    user_prompt = request.prompt
+    target_ticker = request.ticker.upper()
+
+    POLYGON_KEY = os.environ.get("POLYGON_API_KEY")
+    ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+    if not POLYGON_KEY or not ANTHROPIC_KEY:
+        raise HTTPException(status_code=500, detail="Missing API Keys in Backend.")
+
+    # 1. Fetch the raw tape from Polygon first
+    url = f"https://api.polygon.io/v3/snapshot/options/{target_ticker}?limit=250&apiKey={POLYGON_KEY}"
+    
+    raw_flow_context = ""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    chain_data = await resp.json()
+                    
+                    # Aggregate the data so we don't blow up Claude's token limit
+                    total_call_vol, total_put_vol = 0, 0
+                    total_call_oi, total_put_oi = 0, 0
+                    
+                    for c in chain_data.get("results", []):
+                        ctype = c.get("details", {}).get("contract_type", "").lower()
+                        vol = c.get("day", {}).get("volume", 0)
+                        oi = c.get("open_interest", 0)
+                        
+                        if ctype == "call": 
+                            total_call_vol += vol
+                            total_call_oi += oi
+                        elif ctype == "put": 
+                            total_put_vol += vol
+                            total_put_oi += oi
+                            
+                    raw_flow_context = (
+                        f"Live {target_ticker} Options Data:\n"
+                        f"- Volume: {total_call_vol:,} Calls vs {total_put_vol:,} Puts.\n"
+                        f"- Open Interest: {total_call_oi:,} Calls vs {total_put_oi:,} Puts."
+                    )
+                else:
+                    raw_flow_context = f"Warning: Could not retrieve live data for {target_ticker}."
+    except Exception as e:
+        print(f"Polygon fetch error: {e}")
+        raw_flow_context = "Warning: Live data fetch failed."
+
+    # 2. Inject Polygon Data into Claude Opus 4.7
+    client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    
+    sys_prompt = f"""
+    You are the 'Apex Oracle', an elite Wall Street AI.
+    The user is asking about {target_ticker}. 
+    
+    [LIVE POLYGON.IO DATA]: 
+    {raw_flow_context}
+    
+    Using the live data, answer the user's query. Provide a ruthless, institutional breakdown of the options flow. 
+    Do not give financial advice. Keep your answer under 150 words. Use Discord markdown formatting.
+    """
+    
+    try:
+        res = await client.messages.create(
+            model="claude-opus-4-7", 
+            max_tokens=300,
+            system=sys_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
+        
+        analysis = next((b.text for b in res.content if getattr(b, 'type', '') == 'text'), "Analysis failed.")
+        return JSONResponse(content={"analysis": analysis})
+        
+    except Exception as e:
+        print(f"Anthropic error: {e}")
+        raise HTTPException(status_code=500, detail="AI Analysis failed.")
 
 app.include_router(router)
