@@ -253,7 +253,7 @@ async def run_apex_scan():
     🚨 CRITICAL ANTI-HALLUCINATION PROTOCOL 🚨
     You are strictly forbidden from inventing, guessing, or hallucinating financial data. You do not have access to live option chain pricing. 
     1. STRIKE PRICE: You MUST output "ATM" or "First OTM". Do not invent a specific dollar strike.
-    2. EXPIRATION: You MUST output "Next-Month" (for SWINGS) or "Back-Month" (for LEAPS). Do not guess calendar dates.
+    2. EXPIRATION: You MUST output "30-90 Days Out" (if play_type is SWING) or "1+ Year Out" (if play_type is LEAP). Do not guess exact calendar dates.
     3. SL & TP: You MUST use algorithmic or percentage-based rules (e.g., "SL: Trend Invalidation", "TP: Scale on Momentum"). Do NOT invent arbitrary dollar amounts.
 
     In the "thesis", explicitly state WHY the play triggered (Whale Flow, Tech Breakout, or News Catalyst) using the provided data.
