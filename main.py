@@ -314,6 +314,32 @@ async def get_whale_tape():
         print(f"Error reading whale tape: {e}")
         return JSONResponse(content={"tape": []}, status_code=500)
 
+@router.get("/api/chart")
+async def get_chart_data(ticker: str = "SPY"):
+    try:
+        # Fetch 5 days of 15-minute candles
+        stock = await asyncio.to_thread(yf.Ticker, ticker.upper())
+        df = await asyncio.to_thread(stock.history, period="5d", interval="15m")
+        
+        if df.empty:
+            return JSONResponse(content={"chart": []})
+            
+        chart_data = []
+        for index, row in df.iterrows():
+            # Lightweight Charts requires UNIX timestamps in seconds
+            chart_data.append({
+                "time": int(index.timestamp()),
+                "open": round(float(row['Open']), 2),
+                "high": round(float(row['High']), 2),
+                "low": round(float(row['Low']), 2),
+                "close": round(float(row['Close']), 2)
+            })
+            
+        return JSONResponse(content={"chart": chart_data})
+    except Exception as e:
+        print(f"Chart Error on {ticker}: {e}")
+        return JSONResponse(content={"chart": []}, status_code=500)
+
 @router.get("/api/equities/ticker_idea")
 async def get_ticker_idea(ticker: str):
     try:
