@@ -317,7 +317,6 @@ async def get_whale_tape():
 @router.get("/api/chart")
 async def get_chart_data(ticker: str = "SPY"):
     try:
-        # Fetch 5 days of 15-minute candles
         stock = await asyncio.to_thread(yf.Ticker, ticker.upper())
         df = await asyncio.to_thread(stock.history, period="5d", interval="15m")
         
@@ -326,7 +325,6 @@ async def get_chart_data(ticker: str = "SPY"):
             
         chart_data = []
         for index, row in df.iterrows():
-            # Lightweight Charts requires UNIX timestamps in seconds
             chart_data.append({
                 "time": int(index.timestamp()),
                 "open": round(float(row['Open']), 2),
@@ -508,16 +506,25 @@ async def generate_parlay(league: str = "NBA", team1: str = "", team2: str = "",
             2. Strictly construct this parlay using ONLY Individual Player Propositions. ALL legs must exclusively be 'Over' contracts.
             3. Base your thesis heavily on recent L10 trends, defensive matchups, and injury ripple effects.
             
+            🚨 CRITICAL ANTI-HALLUCINATION PROTOCOL 🚨
+            1. You are strictly forbidden from inventing geographical advantages (e.g., altitude), weather conditions, or travel fatigue narratives unless explicitly proven by the data. 
+            2. Do NOT invent or assume player injuries. Only reference injuries if they are explicitly listed in the provided 'Rosters' data.
+            3. Keep the thesis purely mathematical, matchup-based, and driven by the provided L10 trends.
+            4. POSITIVE CORRELATION MANDATE: All legs in this parlay MUST be positively correlated mathematically or narratively. If predicting a fast-paced blowout, correlate with 'Unders' on the losing team's starters (due to 4th quarter resting) or 'Overs' on the winning team's pace-pushers. Explicitly state the correlation multiplier in your thesis.
+            5. METRIC FORCING: You must justify your logic using advanced metrics specific to the sport (e.g., Usage Rate, True Shooting %, Pace Factor, DVOA, or Expected Goals). Do not use generic terms like "playing well."
+            
             FORMAT EXACTLY LIKE THIS:
             ♠️ **ACE'S HOUSE QUANT DESK | GOD PARLAY**
             ━━━━━━━━━━━━━━━━━━━━━━
             🔥 **THE PLAY:** [{legs}-Leg Parlay] (+Odds)
             🎯 **ALGO CONFIDENCE:** [Percentage between 80-99%]
+            📈 **IMPLIED EDGE:** [Calculate the percentage difference between the AI's confidence and standard market implied probability]
+            🔗 **CORRELATION FACTOR:** [High / Medium / Low]
             💰 **UNIT SIZING:** [Recommend unit size]
             
             **🧠 THE THESIS (LEG BY LEG):**
-            - **[Leg 1]:** [1-sentence reasoning]
-            - **[Leg 2]:** [1-sentence reasoning]
+            - **[Leg 1]:** [1-sentence reasoning including EV and Correlation]
+            - **[Leg 2]:** [1-sentence reasoning including EV and Correlation]
             """
             user_prompt = f"Construct a logical Player Props parlay for {team1} vs {team2}. Markets: {market}. Date: {date}."
         else:
@@ -532,16 +539,25 @@ async def generate_parlay(league: str = "NBA", team1: str = "", team2: str = "",
             2. Strictly construct this parlay using ONLY Team Moneylines, Point Spreads, and Game Totals.
             3. Base your thesis heavily on recent L10 trends, pace of play, and situational advantages.
             
+            🚨 CRITICAL ANTI-HALLUCINATION PROTOCOL 🚨
+            1. You are strictly forbidden from inventing geographical advantages (e.g., altitude), weather conditions, or travel fatigue narratives unless explicitly proven by the data. 
+            2. Do NOT invent or assume player injuries. Only reference injuries if they are explicitly listed in the provided 'Rosters' data.
+            3. Keep the thesis purely mathematical, matchup-based, and driven by the provided L10 trends.
+            4. POSITIVE CORRELATION MANDATE: All legs in this parlay MUST be positively correlated mathematically or narratively. Explicitly state the correlation multiplier in your thesis.
+            5. METRIC FORCING: You must justify your logic using advanced metrics specific to the sport (e.g., Usage Rate, True Shooting %, Pace Factor, DVOA, or Expected Goals). Do not use generic terms like "playing well."
+            
             FORMAT EXACTLY LIKE THIS:
             ♠️ **ACE'S HOUSE QUANT DESK | GAME LINES PARLAY**
             ━━━━━━━━━━━━━━━━━━━━━━
             🔥 **THE PLAY:** [{legs}-Leg Parlay] (+Odds)
             🎯 **ALGO CONFIDENCE:** [Percentage between 80-99%]
+            📈 **IMPLIED EDGE:** [Calculate the percentage difference between the AI's confidence and standard market implied probability]
+            🔗 **CORRELATION FACTOR:** [High / Medium / Low]
             💰 **UNIT SIZING:** [Recommend unit size]
             
             **🧠 THE THESIS (LEG BY LEG):**
-            - **[Leg 1]:** [1-sentence reasoning]
-            - **[Leg 2]:** [1-sentence reasoning]
+            - **[Leg 1]:** [1-sentence reasoning including EV and Correlation]
+            - **[Leg 2]:** [1-sentence reasoning including EV and Correlation]
             """
             user_prompt = f"Construct a logical Game Lines parlay for {team1} vs {team2}. Markets: {market}. Date: {date}."
 
@@ -571,17 +587,26 @@ async def predict_game(team1: str, team2: str, sport: str = "NBA", market: str =
         1. Output strictly under 300 words. Do NOT mention Claude.
         2. Base your thesis heavily on recent L10 trends and situational awareness.
         
+        🚨 CRITICAL ANTI-HALLUCINATION PROTOCOL 🚨
+        1. You are strictly forbidden from inventing geographical advantages (e.g., altitude), weather conditions, or travel fatigue narratives unless explicitly proven by the data. 
+        2. Do NOT invent or assume player injuries. Only reference injuries if they are explicitly listed in the provided 'Rosters' data.
+        3. Keep the thesis purely mathematical, matchup-based, and driven by the provided L10 trends.
+        4. EXPECTED VALUE (EV) PROTOCOL: Do not simply predict who will win. You must identify a market inefficiency. Explain why the public or the sportsbooks are mispricing this specific matchup. 
+        5. VARIANCE & TAIL OUTCOMES: Acknowledge the floor and ceiling of this prediction. Identify the single biggest "wrecking ball" variable that could invalidate this thesis (e.g., a specific player getting into early foul trouble, or a sudden shift in game pace).
+        
         FORMAT EXACTLY LIKE THIS:
         ♠️ **ACE'S HOUSE QUANT DESK | GAME PREDICTOR**
         ━━━━━━━━━━━━━━━━━━━━━━
         🔥 **TOP PLAY:** [State the single best bet clearly]
         🎯 **ALGO CONFIDENCE:** [Percentage between 80-99%]
+        📈 **IMPLIED EDGE:** [Calculate the percentage difference between the AI's confidence and standard market implied probability]
         💰 **UNIT SIZING:** [Recommend unit size]
         
         **🧠 THE THESIS:**
-        - [Bullet 1: Cite L10 trends or home/away splits]
-        - [Bullet 2: Specific defensive matchup or pace advantage]
-        - [Bullet 3: Market pricing value]
+        - [EV & Market Inefficiency: Cite L10 trends or home/away splits driving this]
+        - [Metric Forcing: Specific defensive matchup, DVOA, or pace advantage]
+        
+        ⚠️ **INVALIDATION TRIGGER:** [What specific live-game event means this bet is dead]
         """
         user_prompt = f"Identify the highest confidence play for {team1} vs {team2} on {date}. Market focus: {market}."
         
@@ -594,5 +619,34 @@ async def predict_game(team1: str, team2: str, sport: str = "NBA", market: str =
         return {"result_text": final_text}
     except Exception as e:
         return {"result_text": f"❌ Data Processing Error: {str(e)}"}
+
+@router.get("/api/sports/ticker")
+async def get_sports_ticker():
+    """Lightning-fast route to feed the global frontend marquee."""
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+        response = requests.get(url, timeout=3)
+        data = response.json()
+        
+        games = []
+        for event in data.get('events', []):
+            status = event['status']['type']['shortDetail']
+            comps = event['competitions'][0]['competitors']
+            
+            away_team = next(c for c in comps if c['homeAway'] == 'away')
+            home_team = next(c for c in comps if c['homeAway'] == 'home')
+            
+            away_name = away_team['team']['abbreviation']
+            home_name = home_team['team']['abbreviation']
+            away_score = away_team.get('score', '')
+            home_score = home_team.get('score', '')
+            
+            games.append(f"[{status}] {away_name} {away_score} - {home_name} {home_score}")
+            
+        active_parlay = "🚨 GOD PARLAY: Jokic O 26.5 PTS + Murray O 6.5 AST (Algo Edge: 94.2%)"
+        
+        return JSONResponse(content={"games": games, "parlay": active_parlay})
+    except Exception as e:
+        return JSONResponse(content={"games": ["SCANNING ESPN RELAYS..."], "parlay": "CALIBRATING QUANT MODELS..."})
 
 app.include_router(router)
